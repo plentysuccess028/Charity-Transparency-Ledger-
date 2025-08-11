@@ -6,10 +6,14 @@
 (define-constant err-charity-not-verified (err u104))
 (define-constant err-insufficient-funds (err u105))
 (define-constant err-unauthorized (err u106))
+(define-constant err-milestone-not-found (err u107))
+(define-constant err-milestone-already-completed (err u108))
+(define-constant err-invalid-milestone-target (err u109))
 
 (define-data-var contract-balance uint u0)
 (define-data-var next-charity-id uint u1)
 (define-data-var next-donation-id uint u1)
+(define-data-var next-milestone-id uint u1)
 
 (define-map charities 
   { charity-id: uint }
@@ -60,6 +64,30 @@
   { count: uint }
 )
 
+(define-map milestones
+  { milestone-id: uint }
+  {
+    charity-id: uint,
+    title: (string-ascii 128),
+    description: (string-ascii 256),
+    target-amount: uint,
+    current-amount: uint,
+    completed: bool,
+    completion-block: (optional uint),
+    created-block: uint
+  }
+)
+
+(define-map charity-milestones
+  { charity-id: uint, index: uint }
+  { milestone-id: uint }
+)
+
+(define-map charity-milestone-count
+  { charity-id: uint }
+  { count: uint }
+)
+
 (define-public (register-charity (name (string-ascii 128)) (description (string-ascii 256)) (wallet principal))
   (let
     (
@@ -75,7 +103,7 @@
         wallet: wallet,
         verified: false,
         total-received: u0,
-        registration-block: block-height
+        registration-block: stacks-block-height
       }
     )
     (map-set charity-by-wallet { wallet: wallet } { charity-id: charity-id })
@@ -118,7 +146,7 @@
         donor: tx-sender,
         charity-id: charity-id,
         amount: amount,
-        timestamp: block-height,
+        timestamp: stacks-block-height,
         message: message,
         withdrawn: false
       }
@@ -177,6 +205,102 @@
   )
 )
 
+(define-public (create-milestone (charity-id uint) (title (string-ascii 128)) (description (string-ascii 256)) (target-amount uint))
+  (let
+    (
+      (milestone-id (var-get next-milestone-id))
+      (charity-data (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (milestone-count (default-to u0 (get count (map-get? charity-milestone-count { charity-id: charity-id }))))
+    )
+    (asserts! (is-eq tx-sender (get wallet charity-data)) err-unauthorized)
+    (asserts! (> target-amount u0) err-invalid-milestone-target)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      {
+        charity-id: charity-id,
+        title: title,
+        description: description,
+        target-amount: target-amount,
+        current-amount: u0,
+        completed: false,
+        completion-block: none,
+        created-block: stacks-block-height
+      }
+    )
+    
+    (map-set charity-milestones
+      { charity-id: charity-id, index: milestone-count }
+      { milestone-id: milestone-id }
+    )
+    
+    (map-set charity-milestone-count
+      { charity-id: charity-id }
+      { count: (+ milestone-count u1) }
+    )
+    
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (fund-milestone (milestone-id uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) err-milestone-not-found))
+      (charity-data (unwrap! (map-get? charities { charity-id: (get charity-id milestone-data) }) err-not-found))
+      (amount (stx-get-balance tx-sender))
+      (new-current-amount (+ (get current-amount milestone-data) amount))
+      (target-reached (>= new-current-amount (get target-amount milestone-data)))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (get verified charity-data) err-charity-not-verified)
+    (asserts! (not (get completed milestone-data)) err-milestone-already-completed)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data {
+        current-amount: new-current-amount,
+        completed: target-reached,
+        completion-block: (if target-reached (some stacks-block-height) none)
+      })
+    )
+    
+    (map-set charities
+      { charity-id: (get charity-id milestone-data) }
+      (merge charity-data { total-received: (+ (get total-received charity-data) amount) })
+    )
+    
+    (var-set contract-balance (+ (var-get contract-balance) amount))
+    (ok target-reached)
+  )
+)
+
+(define-public (withdraw-milestone-funds (milestone-id uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) err-milestone-not-found))
+      (charity-data (unwrap! (map-get? charities { charity-id: (get charity-id milestone-data) }) err-not-found))
+      (amount (get current-amount milestone-data))
+    )
+    (asserts! (is-eq tx-sender (get wallet charity-data)) err-unauthorized)
+    (asserts! (get completed milestone-data) err-milestone-already-completed)
+    (asserts! (> amount u0) err-invalid-amount)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender (get wallet charity-data))))
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { current-amount: u0 })
+    )
+    
+    (var-set contract-balance (- (var-get contract-balance) amount))
+    (ok amount)
+  )
+)
+
 (define-read-only (get-charity (charity-id uint))
   (map-get? charities { charity-id: charity-id })
 )
@@ -196,9 +320,15 @@
   (let
     (
       (total-donations (default-to u0 (get count (map-get? donor-donation-count { donor: donor }))))
-      (start-index (if (> total-donations limit) (- total-donations limit) u0))
     )
-    (map get-donation-by-index (generate-sequence start-index total-donations donor))
+    (if (> total-donations u0)
+      (let ((last-index (- total-donations u1)))
+        (list 
+          (map-get? donations { donation-id: (default-to u0 (get donation-id (map-get? donor-donations { donor: donor, index: last-index }))) })
+        )
+      )
+      (list)
+    )
   )
 )
 
@@ -206,9 +336,15 @@
   (let
     (
       (total-donations (default-to u0 (get count (map-get? charity-donation-count { charity-id: charity-id }))))
-      (start-index (if (> total-donations limit) (- total-donations limit) u0))
     )
-    (map get-charity-donation-by-index (generate-charity-sequence start-index total-donations charity-id))
+    (if (> total-donations u0)
+      (let ((last-index (- total-donations u1)))
+        (list 
+          (map-get? donations { donation-id: (default-to u0 (get donation-id (map-get? charity-donations { charity-id: charity-id, index: last-index }))) })
+        )
+      )
+      (list)
+    )
   )
 )
 
@@ -226,47 +362,50 @@
   )
 )
 
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-charity-milestones (charity-id uint) (limit uint))
+  (let
+    (
+      (total-milestones (default-to u0 (get count (map-get? charity-milestone-count { charity-id: charity-id }))))
+    )
+    (if (> total-milestones u0)
+      (let ((last-index (- total-milestones u1)))
+        (list 
+          (map-get? milestones { milestone-id: (default-to u0 (get milestone-id (map-get? charity-milestones { charity-id: charity-id, index: last-index }))) })
+        )
+      )
+      (list)
+    )
+  )
+)
+
+(define-read-only (get-milestone-progress (milestone-id uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) (err "milestone not found")))
+      (target (get target-amount milestone-data))
+      (current (get current-amount milestone-data))
+      (percentage (if (> target u0) (/ (* current u100) target) u0))
+    )
+    (ok {
+      milestone-id: milestone-id,
+      target-amount: target,
+      current-amount: current,
+      progress-percentage: percentage,
+      completed: (get completed milestone-data),
+      funds-available: (and (get completed milestone-data) (> current u0))
+    })
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-charities: (- (var-get next-charity-id) u1),
     total-donations: (- (var-get next-donation-id) u1),
+    total-milestones: (- (var-get next-milestone-id) u1),
     contract-balance: (var-get contract-balance)
   }
-)
-
-(define-private (get-donation-by-index (data { index: uint, donor: principal }))
-  (match (map-get? donor-donations { donor: (get donor data), index: (get index data) })
-    donation-ref (map-get? donations { donation-id: (get donation-id donation-ref) })
-    none
-  )
-)
-
-(define-private (get-charity-donation-by-index (data { index: uint, charity-id: uint }))
-  (match (map-get? charity-donations { charity-id: (get charity-id data), index: (get index data) })
-    donation-ref (map-get? donations { donation-id: (get donation-id donation-ref) })
-    none
-  )
-)
-
-(define-private (generate-sequence (start uint) (end uint) (donor principal))
-  (map create-donor-index-data (generate-range start end))
-)
-
-(define-private (generate-charity-sequence (start uint) (end uint) (charity-id uint))
-  (map create-charity-index-data (generate-range start end))
-)
-
-(define-private (create-donor-index-data (index uint))
-  { index: index, donor: tx-sender }
-)
-
-(define-private (create-charity-index-data (index uint))
-  { index: index, charity-id: u0 }
-)
-
-(define-private (generate-range (start uint) (end uint))
-  (if (>= start end)
-    (list)
-    (unwrap-panic (as-max-len? (append (generate-range start (- end u1)) end) u100))
-  )
 )
