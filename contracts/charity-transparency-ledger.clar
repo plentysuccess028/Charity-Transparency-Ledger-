@@ -9,11 +9,15 @@
 (define-constant err-milestone-not-found (err u107))
 (define-constant err-milestone-already-completed (err u108))
 (define-constant err-invalid-milestone-target (err u109))
+(define-constant err-matching-program-not-found (err u110))
+(define-constant err-matching-funds-exhausted (err u111))
+(define-constant err-invalid-match-ratio (err u112))
 
 (define-data-var contract-balance uint u0)
 (define-data-var next-charity-id uint u1)
 (define-data-var next-donation-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-matching-program-id uint u1)
 
 (define-map charities 
   { charity-id: uint }
@@ -86,6 +90,27 @@
 (define-map charity-milestone-count
   { charity-id: uint }
   { count: uint }
+)
+
+(define-map matching-programs
+  { program-id: uint }
+  {
+    sponsor: principal,
+    charity-id: (optional uint),
+    match-ratio: uint,
+    total-funds: uint,
+    remaining-funds: uint,
+    min-donation: uint,
+    max-donation: uint,
+    active: bool,
+    created-block: uint,
+    expiry-block: (optional uint)
+  }
+)
+
+(define-map program-matches
+  { program-id: uint, donation-id: uint }
+  { matched-amount: uint, timestamp: uint }
 )
 
 (define-public (register-charity (name (string-ascii 128)) (description (string-ascii 256)) (wallet principal))
@@ -301,6 +326,127 @@
   )
 )
 
+(define-public (create-matching-program (charity-id (optional uint)) (match-ratio uint) (min-donation uint) (max-donation uint) (expiry-block (optional uint)))
+  (let
+    (
+      (program-id (var-get next-matching-program-id))
+      (amount (stx-get-balance tx-sender))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (and (> match-ratio u0) (<= match-ratio u500)) err-invalid-match-ratio)
+    (asserts! (<= min-donation max-donation) err-invalid-amount)
+    
+    (match charity-id
+      charity-id-val (asserts! (is-some (map-get? charities { charity-id: charity-id-val })) err-not-found)
+      true
+    )
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set matching-programs
+      { program-id: program-id }
+      {
+        sponsor: tx-sender,
+        charity-id: charity-id,
+        match-ratio: match-ratio,
+        total-funds: amount,
+        remaining-funds: amount,
+        min-donation: min-donation,
+        max-donation: max-donation,
+        active: true,
+        created-block: stacks-block-height,
+        expiry-block: expiry-block
+      }
+    )
+    
+    (var-set contract-balance (+ (var-get contract-balance) amount))
+    (var-set next-matching-program-id (+ program-id u1))
+    (ok program-id)
+  )
+)
+
+(define-public (donate-with-matching (charity-id uint) (message (optional (string-ascii 256))))
+  (let
+    (
+      (donation-id (var-get next-donation-id))
+      (charity-data (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (amount (stx-get-balance tx-sender))
+      (donor-count (default-to u0 (get count (map-get? donor-donation-count { donor: tx-sender }))))
+      (charity-count (default-to u0 (get count (map-get? charity-donation-count { charity-id: charity-id }))))
+      (match-result (try-match-donation charity-id amount))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (get verified charity-data) err-charity-not-verified)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set donations
+      { donation-id: donation-id }
+      {
+        donor: tx-sender,
+        charity-id: charity-id,
+        amount: amount,
+        timestamp: stacks-block-height,
+        message: message,
+        withdrawn: false
+      }
+    )
+    
+    (map-set donor-donations
+      { donor: tx-sender, index: donor-count }
+      { donation-id: donation-id }
+    )
+    
+    (map-set donor-donation-count
+      { donor: tx-sender }
+      { count: (+ donor-count u1) }
+    )
+    
+    (map-set charity-donations
+      { charity-id: charity-id, index: charity-count }
+      { donation-id: donation-id }
+    )
+    
+    (map-set charity-donation-count
+      { charity-id: charity-id }
+      { count: (+ charity-count u1) }
+    )
+    
+    (map-set charities
+      { charity-id: charity-id }
+      (merge charity-data { total-received: (+ (get total-received charity-data) amount (get matched-amount match-result)) })
+    )
+    
+    (var-set contract-balance (+ (var-get contract-balance) amount))
+    (var-set next-donation-id (+ donation-id u1))
+    (ok { donation-id: donation-id, matched-amount: (get matched-amount match-result), program-id: (get program-id match-result) })
+  )
+)
+
+(define-public (deactivate-matching-program (program-id uint))
+  (let
+    (
+      (program-data (unwrap! (map-get? matching-programs { program-id: program-id }) err-matching-program-not-found))
+      (remaining-funds (get remaining-funds program-data))
+    )
+    (asserts! (is-eq tx-sender (get sponsor program-data)) err-unauthorized)
+    (asserts! (get active program-data) err-matching-program-not-found)
+    
+    (if (> remaining-funds u0)
+      (try! (as-contract (stx-transfer? remaining-funds tx-sender (get sponsor program-data))))
+      true
+    )
+    
+    (map-set matching-programs
+      { program-id: program-id }
+      (merge program-data { active: false, remaining-funds: u0 })
+    )
+    
+    (var-set contract-balance (- (var-get contract-balance) remaining-funds))
+    (ok remaining-funds)
+  )
+)
+
 (define-read-only (get-charity (charity-id uint))
   (map-get? charities { charity-id: charity-id })
 )
@@ -401,11 +547,85 @@
   )
 )
 
+(define-read-only (get-matching-program (program-id uint))
+  (map-get? matching-programs { program-id: program-id })
+)
+
+(define-read-only (get-available-matches-for-charity (charity-id uint) (donation-amount uint))
+  (let
+    (
+      (matching-programs-list (list 
+        { program-id: u1, match-amount: u0 }
+        { program-id: u2, match-amount: u0 }
+        { program-id: u3, match-amount: u0 }
+      ))
+    )
+    (filter is-valid-match matching-programs-list)
+  )
+)
+
+(define-read-only (get-program-match-history (program-id uint))
+  (match (map-get? matching-programs { program-id: program-id })
+    program (some { 
+      program: program,
+      total-matched: (- (get total-funds program) (get remaining-funds program)),
+      match-count: u0
+    })
+    none
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-charities: (- (var-get next-charity-id) u1),
     total-donations: (- (var-get next-donation-id) u1),
     total-milestones: (- (var-get next-milestone-id) u1),
+    total-matching-programs: (- (var-get next-matching-program-id) u1),
     contract-balance: (var-get contract-balance)
   }
+)
+
+(define-private (try-match-donation (charity-id uint) (donation-amount uint))
+  (let
+    (
+      (program-1 (map-get? matching-programs { program-id: u1 }))
+      (program-2 (map-get? matching-programs { program-id: u2 }))
+      (program-3 (map-get? matching-programs { program-id: u3 }))
+    )
+    (match program-1
+      program-data
+        (if (and 
+              (get active program-data)
+              (>= donation-amount (get min-donation program-data))
+              (<= donation-amount (get max-donation program-data))
+              (or (is-none (get charity-id program-data)) (is-eq (get charity-id program-data) (some charity-id)))
+              (> (get remaining-funds program-data) u0))
+          (apply-match u1 program-data donation-amount)
+          { matched-amount: u0, program-id: u0 })
+      { matched-amount: u0, program-id: u0 }
+    )
+  )
+)
+
+(define-private (apply-match (program-id uint) (program-data { sponsor: principal, charity-id: (optional uint), match-ratio: uint, total-funds: uint, remaining-funds: uint, min-donation: uint, max-donation: uint, active: bool, created-block: uint, expiry-block: (optional uint) }) (donation-amount uint))
+  (let
+    (
+      (potential-match (/ (* donation-amount (get match-ratio program-data)) u100))
+      (actual-match (if (<= potential-match (get remaining-funds program-data)) potential-match (get remaining-funds program-data)))
+    )
+    (if (> actual-match u0)
+      (begin
+        (map-set matching-programs
+          { program-id: program-id }
+          (merge program-data { remaining-funds: (- (get remaining-funds program-data) actual-match) })
+        )
+        { matched-amount: actual-match, program-id: program-id }
+      )
+      { matched-amount: u0, program-id: u0 }
+    )
+  )
+)
+
+(define-private (is-valid-match (match-data { program-id: uint, match-amount: uint }))
+  (> (get program-id match-data) u0)
 )
