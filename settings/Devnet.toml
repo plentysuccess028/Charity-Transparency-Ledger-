@@ -1,0 +1,9 @@
+[network]
+name = "devnet"
+node_rpc_address = "http://localhost:20443"
+faucet_address = "http://localhost:20443/extended/v1/faucets/stx"
+deployer = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"
+
+[accounts.deployer]
+mnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout claw"
+balance = 100000000
