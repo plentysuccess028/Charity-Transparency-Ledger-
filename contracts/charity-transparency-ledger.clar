@@ -12,12 +12,16 @@
 (define-constant err-matching-program-not-found (err u110))
 (define-constant err-matching-funds-exhausted (err u111))
 (define-constant err-invalid-match-ratio (err u112))
+(define-constant err-subscription-not-found (err u113))
+(define-constant err-subscription-already-cancelled (err u114))
+(define-constant err-payment-not-due (err u115))
 
 (define-data-var contract-balance uint u0)
 (define-data-var next-charity-id uint u1)
 (define-data-var next-donation-id uint u1)
 (define-data-var next-milestone-id uint u1)
 (define-data-var next-matching-program-id uint u1)
+(define-data-var next-subscription-id uint u1)
 
 (define-map charities 
   { charity-id: uint }
@@ -111,6 +115,40 @@
 (define-map program-matches
   { program-id: uint, donation-id: uint }
   { matched-amount: uint, timestamp: uint }
+)
+
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    donor: principal,
+    charity-id: uint,
+    amount: uint,
+    interval-blocks: uint,
+    next-payment-block: uint,
+    total-payments: uint,
+    active: bool,
+    created-block: uint
+  }
+)
+
+(define-map donor-subscriptions
+  { donor: principal, index: uint }
+  { subscription-id: uint }
+)
+
+(define-map donor-subscription-count
+  { donor: principal }
+  { count: uint }
+)
+
+(define-map charity-subscriptions
+  { charity-id: uint, index: uint }
+  { subscription-id: uint }
+)
+
+(define-map charity-subscription-count
+  { charity-id: uint }
+  { count: uint }
 )
 
 (define-public (register-charity (name (string-ascii 128)) (description (string-ascii 256)) (wallet principal))
@@ -581,6 +619,7 @@
     total-donations: (- (var-get next-donation-id) u1),
     total-milestones: (- (var-get next-milestone-id) u1),
     total-matching-programs: (- (var-get next-matching-program-id) u1),
+    total-subscriptions: (- (var-get next-subscription-id) u1),
     contract-balance: (var-get contract-balance)
   }
 )
@@ -628,4 +667,187 @@
 
 (define-private (is-valid-match (match-data { program-id: uint, match-amount: uint }))
   (> (get program-id match-data) u0)
+)
+
+(define-public (create-subscription (charity-id uint) (amount uint) (interval-blocks uint))
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (charity-data (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (donor-sub-count (default-to u0 (get count (map-get? donor-subscription-count { donor: tx-sender }))))
+      (charity-sub-count (default-to u0 (get count (map-get? charity-subscription-count { charity-id: charity-id }))))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> interval-blocks u0) err-invalid-amount)
+    (asserts! (get verified charity-data) err-charity-not-verified)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      {
+        donor: tx-sender,
+        charity-id: charity-id,
+        amount: amount,
+        interval-blocks: interval-blocks,
+        next-payment-block: (+ stacks-block-height interval-blocks),
+        total-payments: u0,
+        active: true,
+        created-block: stacks-block-height
+      }
+    )
+    
+    (map-set donor-subscriptions
+      { donor: tx-sender, index: donor-sub-count }
+      { subscription-id: subscription-id }
+    )
+    
+    (map-set donor-subscription-count
+      { donor: tx-sender }
+      { count: (+ donor-sub-count u1) }
+    )
+    
+    (map-set charity-subscriptions
+      { charity-id: charity-id, index: charity-sub-count }
+      { subscription-id: subscription-id }
+    )
+    
+    (map-set charity-subscription-count
+      { charity-id: charity-id }
+      { count: (+ charity-sub-count u1) }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (process-subscription-payment (subscription-id uint))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+      (charity-data (unwrap! (map-get? charities { charity-id: (get charity-id subscription-data) }) err-not-found))
+      (amount (get amount subscription-data))
+      (donation-id (var-get next-donation-id))
+      (donor-count (default-to u0 (get count (map-get? donor-donation-count { donor: (get donor subscription-data) }))))
+      (charity-count (default-to u0 (get count (map-get? charity-donation-count { charity-id: (get charity-id subscription-data) }))))
+    )
+    (asserts! (get active subscription-data) err-subscription-already-cancelled)
+    (asserts! (>= stacks-block-height (get next-payment-block subscription-data)) err-payment-not-due)
+    (asserts! (>= (stx-get-balance (get donor subscription-data)) amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? amount (get donor subscription-data) (as-contract tx-sender)))
+    
+    (map-set donations
+      { donation-id: donation-id }
+      {
+        donor: (get donor subscription-data),
+        charity-id: (get charity-id subscription-data),
+        amount: amount,
+        timestamp: stacks-block-height,
+        message: (some "Recurring subscription payment"),
+        withdrawn: false
+      }
+    )
+    
+    (map-set donor-donations
+      { donor: (get donor subscription-data), index: donor-count }
+      { donation-id: donation-id }
+    )
+    
+    (map-set donor-donation-count
+      { donor: (get donor subscription-data) }
+      { count: (+ donor-count u1) }
+    )
+    
+    (map-set charity-donations
+      { charity-id: (get charity-id subscription-data), index: charity-count }
+      { donation-id: donation-id }
+    )
+    
+    (map-set charity-donation-count
+      { charity-id: (get charity-id subscription-data) }
+      { count: (+ charity-count u1) }
+    )
+    
+    (map-set charities
+      { charity-id: (get charity-id subscription-data) }
+      (merge charity-data { total-received: (+ (get total-received charity-data) amount) })
+    )
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { 
+        next-payment-block: (+ stacks-block-height (get interval-blocks subscription-data)),
+        total-payments: (+ (get total-payments subscription-data) u1)
+      })
+    )
+    
+    (var-set contract-balance (+ (var-get contract-balance) amount))
+    (var-set next-donation-id (+ donation-id u1))
+    (ok donation-id)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get donor subscription-data)) err-unauthorized)
+    (asserts! (get active subscription-data) err-subscription-already-cancelled)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-donor-subscriptions (donor principal))
+  (let
+    (
+      (total-subs (default-to u0 (get count (map-get? donor-subscription-count { donor: donor }))))
+    )
+    (if (> total-subs u0)
+      (let ((last-index (- total-subs u1)))
+        (list 
+          (map-get? subscriptions { subscription-id: (default-to u0 (get subscription-id (map-get? donor-subscriptions { donor: donor, index: last-index }))) })
+        )
+      )
+      (list)
+    )
+  )
+)
+
+(define-read-only (get-charity-subscriptions (charity-id uint))
+  (let
+    (
+      (total-subs (default-to u0 (get count (map-get? charity-subscription-count { charity-id: charity-id }))))
+    )
+    (if (> total-subs u0)
+      (let ((last-index (- total-subs u1)))
+        (list 
+          (map-get? subscriptions { subscription-id: (default-to u0 (get subscription-id (map-get? charity-subscriptions { charity-id: charity-id, index: last-index }))) })
+        )
+      )
+      (list)
+    )
+  )
+)
+
+(define-read-only (is-payment-due (subscription-id uint))
+  (match (map-get? subscriptions { subscription-id: subscription-id })
+    subscription-data (ok {
+      due: (and (get active subscription-data) (>= stacks-block-height (get next-payment-block subscription-data))),
+      next-payment-block: (get next-payment-block subscription-data),
+      blocks-until-payment: (if (>= stacks-block-height (get next-payment-block subscription-data)) 
+                              u0 
+                              (- (get next-payment-block subscription-data) stacks-block-height))
+    })
+    err-subscription-not-found
+  )
 )
