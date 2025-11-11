@@ -851,3 +851,78 @@
     err-subscription-not-found
   )
 )
+
+(define-data-var next-expenditure-id uint u1)
+
+(define-map expenditures
+  { expense-id: uint }
+  {
+    charity-id: uint,
+    amount: uint,
+    category: (string-ascii 64),
+    memo: (optional (string-ascii 256)),
+    timestamp: uint
+  }
+)
+
+(define-map charity-expenditures
+  { charity-id: uint, index: uint }
+  { expense-id: uint }
+)
+
+(define-map charity-expenditure-count
+  { charity-id: uint }
+  { count: uint }
+)
+
+(define-public (record-expenditure (charity-id uint) (amount uint) (category (string-ascii 64)) (memo (optional (string-ascii 256))))
+  (let
+    (
+      (expense-id (var-get next-expenditure-id))
+      (charity-data (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (charity-count (default-to u0 (get count (map-get? charity-expenditure-count { charity-id: charity-id }))))
+    )
+    (asserts! (is-eq tx-sender (get wallet charity-data)) err-unauthorized)
+    (asserts! (> amount u0) err-invalid-amount)
+    (map-set expenditures
+      { expense-id: expense-id }
+      {
+        charity-id: charity-id,
+        amount: amount,
+        category: category,
+        memo: memo,
+        timestamp: stacks-block-height
+      }
+    )
+    (map-set charity-expenditures
+      { charity-id: charity-id, index: charity-count }
+      { expense-id: expense-id }
+    )
+    (map-set charity-expenditure-count
+      { charity-id: charity-id }
+      { count: (+ charity-count u1) }
+    )
+    (var-set next-expenditure-id (+ expense-id u1))
+    (ok expense-id)
+  )
+)
+
+(define-read-only (get-expenditure (expense-id uint))
+  (map-get? expenditures { expense-id: expense-id })
+)
+
+(define-read-only (get-charity-expenditures (charity-id uint) (limit uint))
+  (let
+    (
+      (total (default-to u0 (get count (map-get? charity-expenditure-count { charity-id: charity-id }))))
+    )
+    (if (> total u0)
+      (let ((last-index (- total u1)))
+        (list 
+          (map-get? expenditures { expense-id: (default-to u0 (get expense-id (map-get? charity-expenditures { charity-id: charity-id, index: last-index }))) })
+        )
+      )
+      (list)
+    )
+  )
+)
