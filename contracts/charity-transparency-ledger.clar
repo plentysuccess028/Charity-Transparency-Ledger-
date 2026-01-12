@@ -926,3 +926,95 @@
     )
   )
 )
+
+(define-constant err-document-not-found (err u116))
+
+(define-data-var next-document-id uint u1)
+
+(define-map documents
+  { document-id: uint }
+  {
+    charity-id: uint,
+    doc-type: (string-ascii 64),
+    cid: (string-ascii 64),
+    memo: (optional (string-ascii 256)),
+    timestamp: uint,
+    verified: bool
+  }
+)
+
+(define-map charity-documents
+  { charity-id: uint, index: uint }
+  { document-id: uint }
+)
+
+(define-map charity-document-count
+  { charity-id: uint }
+  { count: uint }
+)
+
+(define-public (create-charity-document (charity-id uint) (doc-type (string-ascii 64)) (cid (string-ascii 64)) (memo (optional (string-ascii 256))))
+  (let
+    (
+      (document-id (var-get next-document-id))
+      (charity-data (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (count (default-to u0 (get count (map-get? charity-document-count { charity-id: charity-id }))))
+    )
+    (asserts! (is-eq tx-sender (get wallet charity-data)) err-unauthorized)
+    (map-set documents
+      { document-id: document-id }
+      {
+        charity-id: charity-id,
+        doc-type: doc-type,
+        cid: cid,
+        memo: memo,
+        timestamp: stacks-block-height,
+        verified: false
+      }
+    )
+    (map-set charity-documents
+      { charity-id: charity-id, index: count }
+      { document-id: document-id }
+    )
+    (map-set charity-document-count
+      { charity-id: charity-id }
+      { count: (+ count u1) }
+    )
+    (var-set next-document-id (+ document-id u1))
+    (ok document-id)
+  )
+)
+
+(define-public (verify-charity-document (document-id uint))
+  (let
+    (
+      (doc-data (unwrap! (map-get? documents { document-id: document-id }) err-document-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set documents
+      { document-id: document-id }
+      (merge doc-data { verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-document (document-id uint))
+  (map-get? documents { document-id: document-id })
+)
+
+(define-read-only (get-charity-documents (charity-id uint) (limit uint))
+  (let
+    (
+      (total (default-to u0 (get count (map-get? charity-document-count { charity-id: charity-id }))))
+    )
+    (if (> total u0)
+      (let ((last-index (- total u1)))
+        (list 
+          (map-get? documents { document-id: (default-to u0 (get document-id (map-get? charity-documents { charity-id: charity-id, index: last-index }))) })
+        )
+      )
+      (list)
+    )
+  )
+)
